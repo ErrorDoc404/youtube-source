@@ -1,3 +1,4 @@
+
 package dev.lavalink.youtube.clients.skeleton;
 
 import com.sedmelluq.discord.lavaplayer.tools.*;
@@ -13,6 +14,7 @@ import dev.lavalink.youtube.cipher.CipherManager.CachedPlayerScript;
 import dev.lavalink.youtube.clients.ClientConfig;
 import dev.lavalink.youtube.track.TemporalInfo;
 import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.util.EntityUtils;
@@ -25,7 +27,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static com.sedmelluq.discord.lavaplayer.tools.FriendlyException.Severity.COMMON;
@@ -40,7 +46,25 @@ public abstract class NonMusicClient implements Client {
     protected static String WEB_PLAYER_PARAMS = "2AMB";
     protected static String MOBILE_PLAYER_PARAMS = "CgIIAdgDAQ%3D%3D";
 
+    // Cache for encrypted host flags: videoId -> CachedHostFlags
+    private static final Map<String, CachedHostFlags> encryptedHostFlagsCache = new ConcurrentHashMap<>();
+    private static final long HOST_FLAGS_CACHE_TTL = 3600000; // 1 hour in milliseconds
+
     protected int playlistPageCount = 6;
+
+    private static class CachedHostFlags {
+        final String flags;
+        final long timestamp;
+
+        CachedHostFlags(String flags) {
+            this.flags = flags;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > HOST_FLAGS_CACHE_TTL;
+        }
+    }
 
     //<editor-fold desc="Class-Specific Methods">
     /**
@@ -108,8 +132,7 @@ public abstract class NonMusicClient implements Client {
 
         ClientConfig config = getBaseClientConfig(httpInterface);
 
-        if (status == null) {
-            // Only add embed info if the status is not NON_EMBEDDABLE.
+        if (status == null || status != PlayabilityStatus.NON_EMBEDDABLE) {
             config.withClientField("clientScreen", "EMBED")
                 .withThirdPartyEmbedUrl("https://google.com");
         }
@@ -122,6 +145,14 @@ public abstract class NonMusicClient implements Client {
 
         if (params != null) {
             config.withRootField("params", params);
+        }
+
+        if (isEmbedded()) {
+            String encryptedHostFlags = fetchEncryptedHostFlags(httpInterface, videoId);
+
+            if (encryptedHostFlags != null) {
+                config.withEncryptedHostFlags(encryptedHostFlags);
+            }
         }
 
         String payload = config.setAttributes(httpInterface).toJsonString();
@@ -141,42 +172,92 @@ public abstract class NonMusicClient implements Client {
         JsonBrowser playabilityJson = json.get("playabilityStatus");
         JsonBrowser videoDetails = json.get("videoDetails");
 
-        // we should always check playabilityStatus if videoDetails is null because it could contain important
-        // information as to why, which prevents false reports about this not working as intended etc etc.
         if (validatePlayabilityStatus || videoDetails.isNull()) {
-            // fix: Make this method throw if a status was supplied (typically when we recurse).
             PlayabilityStatus playabilityStatus = getPlayabilityStatus(playabilityJson, status != null);
 
-            // All other branches should've been caught by getPlayabilityStatus().
-            // An exception will be thrown if we can't handle it.
             if (playabilityStatus == PlayabilityStatus.NON_EMBEDDABLE) {
                 if (isEmbedded()) {
-                    throw new FriendlyException("Loading information for video failed", Severity.COMMON,
-                        new RuntimeException("Non-embeddable video cannot be loaded by embedded client"));
+                throw new FriendlyException("Loading information for video failed", Severity.COMMON,
+                    new RuntimeException("Non-embeddable video cannot be loaded by embedded client"));
+            }
+
+            json = loadTrackInfoFromInnertube(source, httpInterface, videoId, playabilityStatus, true);
+            getPlayabilityStatus(json.get("playabilityStatus"), true);
+        }
+    }
+
+    if (videoDetails.isNull()) {
+        throw new FriendlyException("Loading information for video failed", Severity.SUSPICIOUS,
+            new RuntimeException("Missing videoDetails block, JSON: " + json.format()));
+    }
+
+    if (!videoId.equals(videoDetails.get("videoId").text())) {
+        throw new FriendlyException(
+            "The video returned is not what was requested.",
+            Severity.SUSPICIOUS,
+            new RuntimeException("Incorrect video response, JSON: " + json.format())
+        );
+    }
+
+    return json;
+}
+
+    /**
+     * Fetches the encryptedHostFlags from the YouTube embed page with caching.
+     *
+     * @param httpInterface The HTTP interface to use for fetching the page.
+     * @param videoId The video ID to fetch flags for.
+     * @return The encryptedHostFlags string, or null if not found.
+     */
+    @Nullable
+    private String fetchEncryptedHostFlags(@NotNull HttpInterface httpInterface, @NotNull String videoId) {
+        // Check cache first
+        CachedHostFlags cached = encryptedHostFlagsCache.get(videoId);
+        if (cached != null && !cached.isExpired()) {
+            log.debug("Using cached encryptedHostFlags for video: {}", videoId);
+            return cached.flags;
+        }
+
+        // If expired, remove from cache
+        if (cached != null && cached.isExpired()) {
+            encryptedHostFlagsCache.remove(videoId);
+        }
+
+        String embedUrl = "https://youtube.com/embed/" + videoId;
+
+        try {
+            HttpGet request = new HttpGet(embedUrl);
+            request.setHeader("Referer", "https://www.google.com");
+
+            try (CloseableHttpResponse response = httpInterface.execute(request)) {
+                int statusCode = response.getStatusLine().getStatusCode();
+
+                if (!HttpClientTools.isSuccessWithContent(statusCode)) {
+                    log.debug("Failed to fetch encrypted host flags from {}: HTTP {}", embedUrl, statusCode);
+                    return null;
                 }
 
-                // forcefully set validatePlayabilityStatus to true because the code is at this point for a reason.
-                // we want to make sure the re-check gets an accurate reason for any playability issues.
-                json = loadTrackInfoFromInnertube(source, httpInterface, videoId, playabilityStatus, true);
-                getPlayabilityStatus(json.get("playabilityStatus"), true);
+                String htmlContent = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                Pattern pattern = Pattern.compile("\"encryptedHostFlags\":\"([^\"]+)\"");
+                Matcher matcher = pattern.matcher(htmlContent);
+
+                if (matcher.find()) {
+                    String flags = matcher.group(1);
+                    log.debug("Extracted and cached encryptedHostFlags for video {}", videoId);
+                    // Cache the result
+                    encryptedHostFlagsCache.put(videoId, new CachedHostFlags(flags));
+                    return flags;
+                }
+
+                log.debug("Could not find encryptedHostFlags in embed page for video: {}", videoId);
+                return null;
             }
+        } catch (IOException e) {
+            log.warn("Error fetching encryptedHostFlags for video {}: {}", videoId, e.getMessage());
+            return null;
         }
-
-        if (videoDetails.isNull()) {
-            throw new FriendlyException("Loading information for video failed", Severity.SUSPICIOUS,
-                new RuntimeException("Missing videoDetails block, JSON: " + json.format()));
-        }
-
-        if (!videoId.equals(videoDetails.get("videoId").text())) {
-            throw new FriendlyException(
-                "The video returned is not what was requested.",
-                Severity.SUSPICIOUS,
-                new RuntimeException("Incorrect video response, JSON: " + json.format())
-            );
-        }
-
-        return json;
     }
+
 
     @NotNull
     protected JsonBrowser loadSearchResults(@NotNull HttpInterface httpInterface,

@@ -1,3 +1,4 @@
+
 package dev.lavalink.youtube.clients;
 
 import com.grack.nanojson.JsonWriter;
@@ -130,6 +131,14 @@ public class ClientConfig {
         Map<String, Object> contentPlaybackContext = putOnceAndJoin(playbackContext, "contentPlaybackContext");
         contentPlaybackContext.put("signatureTimestamp", signatureTimestamp);
         return this;
+    }
+
+    public void withEncryptedHostFlags(String encryptedHostFlags) {
+        if (encryptedHostFlags != null) {
+            Map<String, Object> playbackContext = putOnceAndJoin(root, "playbackContext");
+            Map<String, Object> contentPlaybackContext = putOnceAndJoin(playbackContext, "contentPlaybackContext");
+            contentPlaybackContext.put("encryptedHostFlags", encryptedHostFlags);
+        }
     }
 
     public ClientConfig withRootField(@NotNull String key,
